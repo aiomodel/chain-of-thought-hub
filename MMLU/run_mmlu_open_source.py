@@ -11,10 +11,10 @@ import torch
 import transformers
 from datasets import load_dataset
 from transformers import LlamaForCausalLM, LlamaTokenizer, AutoTokenizer, AutoModelForCausalLM, AutoConfig
-import tensor_parallel as tp
+# import tensor_parallel as tp
 import accelerate
-from .custom_gpt2 import GPT2ForCausalLM
-from .custom_tokenizer import WarpTikTokenizer
+from custom_gpt2 import GPT2ForCausalLM
+from custom_tokenizer import WarpTikTokenizer
 
 
 TASKS = [
@@ -144,7 +144,7 @@ def load(ckpt_dir, model_type):
         tokenizer.bos_token_id = 1
 
         model = LlamaForCausalLM.from_pretrained(ckpt_dir, low_cpu_mem_usage = True, torch_dtype=torch.float16)
-        model = tp.tensor_parallel(model, [i for i in range(n_gpus)]) 
+        # model = tp.tensor_parallel(model, [i for i in range(n_gpus)]) 
     elif model_type == 'ours':
         tokenizer = WarpTikTokenizer(add_bos_token=False, add_eos_token=False)
         tokenizer.padding_side = "left"
@@ -152,6 +152,8 @@ def load(ckpt_dir, model_type):
         tokenizer.model_max_length = 2048
         # model = AutoModelForCausalLM.from_pretrained(ckpt_dir, device_map = 'balanced_low_0', torch_dtype=torch.bfloat16, trust_remote_code=True)
         _config = AutoConfig.from_pretrained(ckpt_dir)
+        _config.use_flash_attn = False
+        _config.scale_attn_weights = True
         model = GPT2ForCausalLM(_config)
         model.from_pretrained(ckpt_dir,
             device_map="balanced_low_0",
@@ -181,6 +183,7 @@ def load(ckpt_dir, model_type):
         tokenizer.pad_token_id = 0 if tokenizer.pad_token_id is None else tokenizer.pad_token_id
         tokenizer.bos_token_id = 1
 
+    model.to("cuda")
     model.eval()
 
     return model, tokenizer
