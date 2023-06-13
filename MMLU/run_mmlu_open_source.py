@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import time 
 from tqdm import tqdm
 import argparse
@@ -9,9 +10,11 @@ import pandas as pd
 import torch
 import transformers
 from datasets import load_dataset
-from transformers import LlamaForCausalLM, LlamaTokenizer, AutoTokenizer, AutoModelForCausalLM
+from transformers import LlamaForCausalLM, LlamaTokenizer, AutoTokenizer, AutoModelForCausalLM, AutoConfig
 import tensor_parallel as tp
 import accelerate
+from .custom_gpt2 import GPT2ForCausalLM
+from .custom_tokenizer import WarpTikTokenizer
 
 
 TASKS = [
@@ -137,16 +140,46 @@ def load(ckpt_dir, model_type):
     if model_type == 'llama':
         # we use tensor parallel for loading llama
         tokenizer = LlamaTokenizer.from_pretrained(ckpt_dir, use_fast=False, padding_side="left")
-        
+        tokenizer.pad_token_id = 0 if tokenizer.pad_token_id is None else tokenizer.pad_token_id
+        tokenizer.bos_token_id = 1
+
         model = LlamaForCausalLM.from_pretrained(ckpt_dir, low_cpu_mem_usage = True, torch_dtype=torch.float16)
         model = tp.tensor_parallel(model, [i for i in range(n_gpus)]) 
+    elif model_type == 'ours':
+        tokenizer = WarpTikTokenizer(add_bos_token=False, add_eos_token=False)
+        tokenizer.padding_side = "left"
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.model_max_length = 2048
+        # model = AutoModelForCausalLM.from_pretrained(ckpt_dir, device_map = 'balanced_low_0', torch_dtype=torch.bfloat16, trust_remote_code=True)
+        _config = AutoConfig.from_pretrained(ckpt_dir)
+        model = GPT2ForCausalLM(_config)
+        model.from_pretrained(ckpt_dir,
+            device_map="balanced_low_0",
+            offload_folder="./offload",
+            load_in_8bit=False,
+            torch_dtype=_config.torch_dtype, #"null"
+        )
+        checkpoint_file = os.path.join(ckpt_dir, "pytorch_model.bin")
+        ckpt = torch.load(checkpoint_file)
+        msg = model.load_state_dict(ckpt, strict=False)
+        missing_keys = msg.missing_keys
+        unexpected_keys = msg.unexpected_keys
+        #### NOTICE: inv_freq, core_attention.bias, core_attention.masked_bias are buffers, which can be ignored
+        if model._keys_to_ignore_on_load_missing is not None:
+            for pat in model._keys_to_ignore_on_load_missing:
+                missing_keys = [k for k in missing_keys if re.search(pat, k) is None]
+        if model._keys_to_ignore_on_load_unexpected is not None:
+            for pat in model._keys_to_ignore_on_load_unexpected:
+                unexpected_keys = [k for k in unexpected_keys if re.search(pat, k) is None]
+        print("loading msg:", "\n\tmissing:", missing_keys, "\n\tunexpected:", unexpected_keys)
+        assert len(missing_keys) == 0 and len(unexpected_keys) == 0, "error in loading ckpt"
     else:
         # however, tensor parallel for running falcon will occur bugs
         tokenizer = AutoTokenizer.from_pretrained(ckpt_dir, use_fast=False, padding_side="left")
         model = AutoModelForCausalLM.from_pretrained(ckpt_dir, device_map = 'balanced_low_0', torch_dtype=torch.bfloat16, trust_remote_code=True)
 
-    tokenizer.pad_token_id = 0 if tokenizer.pad_token_id is None else tokenizer.pad_token_id
-    tokenizer.bos_token_id = 1
+        tokenizer.pad_token_id = 0 if tokenizer.pad_token_id is None else tokenizer.pad_token_id
+        tokenizer.bos_token_id = 1
 
     model.eval()
 
