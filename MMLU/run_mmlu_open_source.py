@@ -145,6 +145,7 @@ def load(ckpt_dir, model_type):
 
         model = LlamaForCausalLM.from_pretrained(ckpt_dir, low_cpu_mem_usage = True, torch_dtype=torch.float16)
         # model = tp.tensor_parallel(model, [i for i in range(n_gpus)]) 
+        model.to("cuda")
     elif model_type == 'ours':
         tokenizer = WarpTikTokenizer(add_bos_token=False, add_eos_token=False)
         tokenizer.padding_side = "left"
@@ -175,6 +176,7 @@ def load(ckpt_dir, model_type):
                 unexpected_keys = [k for k in unexpected_keys if re.search(pat, k) is None]
         print("loading msg:", "\n\tmissing:", missing_keys, "\n\tunexpected:", unexpected_keys)
         assert len(missing_keys) == 0 and len(unexpected_keys) == 0, "error in loading ckpt"
+        model.to("cuda")
     else:
         # however, tensor parallel for running falcon will occur bugs
         tokenizer = AutoTokenizer.from_pretrained(ckpt_dir, use_fast=False, padding_side="left")
@@ -183,7 +185,6 @@ def load(ckpt_dir, model_type):
         tokenizer.pad_token_id = 0 if tokenizer.pad_token_id is None else tokenizer.pad_token_id
         tokenizer.bos_token_id = 1
 
-    model.to("cuda")
     model.eval()
 
     return model, tokenizer
