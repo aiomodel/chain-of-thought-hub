@@ -202,14 +202,19 @@ def rotate_half(x):
     x1, x2 = x[..., :x.shape[-1] // 2], x[..., x.shape[-1] // 2:]
     return torch.cat((-x2, x1), dim=x1.ndim - 1)  # dim=-1 triggers a bug in earlier torch versions
 
-@torch.jit.script
-def apply_rotary_pos_emb(q, k, cos, sin, offset: int = 0):
-    cos, sin = cos[offset:q.shape[0] + offset, ...].unsqueeze(0).unsqueeze(0), sin[offset:q.shape[0] + offset, ...].unsqueeze(0).unsqueeze(0)
-    return (q * cos) + (rotate_half(q) * sin), (k * cos) + (rotate_half(k) * sin)
+def apply_rotary_pos_emb(q, k, cos, sin, offset = 0):
+    if type(offset) == int:
+        offset = [offset, offset]
+    cos_q, sin_q = cos[offset[0]:q.shape[0] + offset[0], ...].unsqueeze(0).unsqueeze(0), sin[offset[0]:q.shape[0] + offset[0], ...].unsqueeze(0).unsqueeze(0)
+    cos_k, sin_k = cos[offset[1]:k.shape[0] + offset[1], ...].unsqueeze(0).unsqueeze(0), sin[offset[1]:k.shape[0] + offset[1], ...].unsqueeze(0).unsqueeze(0)
+    return (q * cos_q) + (rotate_half(q) * sin_q), (k * cos_k) + (rotate_half(k) * sin_k)
 
-def apply_rotary_pos_emb_torch(q, k, cos, sin, offset: int = 0):  # jitting fails with bf16
-    cos, sin = cos[offset:q.shape[0] + offset, ...], sin[offset:q.shape[0] + offset, ...]
-    return (q * cos) + (rotate_half(q) * sin), (k * cos) + (rotate_half(k) * sin)
+def apply_rotary_pos_emb_torch(q, k, cos, sin, offset = 0):  # jitting fails with bf16
+    if type(offset) == int:
+        offset = [offset, offset]
+    cos_q, sin_q = cos[offset[0]:q.shape[0] + offset[0], ...], sin[offset[0]:q.shape[0] + offset[0], ...]
+    cos_k, sin_k = cos[offset[1]:k.shape[0] + offset[1], ...], sin[offset[1]:k.shape[0] + offset[1], ...]
+    return (q * cos_q) + (rotate_half(q) * sin_q), (k * cos_k) + (rotate_half(k) * sin_k)
 
 
 class CoreAttention(nn.Module):
@@ -259,7 +264,7 @@ class CoreAttention(nn.Module):
         key_layer = key_layer.permute(2, 0, 1, 3).contiguous()
         value_layer = value_layer.permute(2, 0, 1, 3).contiguous()
         if layer_past is not None:
-            layer_past = layer_past.permute(2, 0, 1, 3).contiguous()
+            layer_past = tuple(_layer_past.permute(2, 0, 1, 3).contiguous() for _layer_past in layer_past)
 
         # [b, np, sq, sk]
         output_size = (query_layer.size(1),
@@ -280,7 +285,8 @@ class CoreAttention(nn.Module):
             output_size[2],
             output_size[3],
             dtype=query_layer.dtype,
-            device=torch.cuda.current_device())
+            device=query_layer.device)
+            # device=torch.cuda.current_device())
 
         # Rotary embeddings
         if self.rope:
@@ -288,9 +294,10 @@ class CoreAttention(nn.Module):
 
             seq_len = key_layer.shape[0]
             offset = 0
-            if layer_past is not None and layer_past.numel() > 0:
-                offset = layer_past[0].shape[0]
-                seq_len += offset
+            if layer_past is not None and layer_past[0].numel() > 0:
+                offset = [layer_past[0].shape[0], offset]
+                # for cache: we have complete key/value (i.e. layer_past)
+                # seq_len += offset
             cos, sin = self.rotary_emb(value_layer, seq_len=seq_len)
             query_layer, key_layer = apply_rotary_fn(query_layer, key_layer, cos, sin, offset=offset)
 
@@ -413,7 +420,7 @@ class FlashSelfAttention(nn.Module):
         key_layer = key_layer.permute(2, 0, 1, 3).contiguous()
         value_layer = value_layer.permute(2, 0, 1, 3).contiguous()
         if layer_past is not None:
-            layer_past = layer_past.permute(2, 0, 1, 3).contiguous()
+            layer_past = tuple(_layer_past.permute(2, 0, 1, 3).contiguous() for _layer_past in layer_past)
 
         seqlen = query_layer.shape[0]
         assert seqlen == key_layer.shape[0]
@@ -431,9 +438,10 @@ class FlashSelfAttention(nn.Module):
 
             seq_len = key_layer.shape[0]
             offset = 0
-            if layer_past is not None and layer_past.numel() > 0:
-                offset = layer_past[0].shape[0]
-                seq_len += offset
+            if layer_past is not None and layer_past[0].numel() > 0:
+                offset = [layer_past[0].shape[0], offset]
+                # for cache: we have complete key/value (i.e. layer_past)
+                # seq_len += offset
             cos, sin = self.rotary_emb(value_layer, seq_len=seq_len)
             query_layer, key_layer = apply_rotary_fn(query_layer, key_layer, cos, sin, offset=offset)
         
@@ -1057,7 +1065,7 @@ class GPT2Model(GPT2PreTrainedModel):
 
         self.wte = nn.Embedding(config.vocab_size, self.embed_dim)
         self.rope = hasattr(config, "rope") and config.rope
-        if not self.rope:
+        if not self.rope or (hasattr(config, "force_ape") and config.force_ape):
             self.wpe = nn.Embedding(config.max_position_embeddings, self.embed_dim)
         self.drop = nn.Dropout(config.embd_pdrop)
         self.h = nn.ModuleList([GPT2Block(config, layer_idx=i) for i in range(config.num_hidden_layers)])
